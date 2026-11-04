@@ -32,7 +32,11 @@ export interface TargetNode extends VesselNode {
 
 export interface EvaluatorOptions {
   zones: Zone[]
-  /** Zones used instead of `zones` while own ship and the target are both slower than `slowSpeed`. */
+  /**
+   * Zones used instead of `zones` while own ship and the target are both
+   * slower than `slowSpeed`, and for a stopped target. A target own ship
+   * overtakes slower than that is judged by `zones` cut to these distances.
+   */
   slowZones: Zone[]
   /** Speed (m/s) below which `slowZones` apply; 0 turns this off. */
   slowSpeed: number
@@ -67,6 +71,24 @@ const SLOW_RELEASE_MARGIN = 0.25
 // within 75°, so a target near abeam does not swap between the two.
 const ASTERN_ENTER = -0.26
 const ASTERN_LEAVE = 0.26
+
+// We come up on a boat from more than 22.5° abaft its beam (COLREG rule 13)
+// when its course points away from us within 67.5°.
+const ABAFT_BEAM = Math.cos((67.5 * Math.PI) / 180)
+
+// An overtaken boat's closest approach wanders with speed noise as we draw
+// abreast, now and then onto our track for a moment. It raises a level only
+// once its time in a zone, less a third of its time out of one, adds up to
+// this (ms): a boat that turns into us stays in the zone, though it may slip
+// out between two of its reports, while noise only dips in. Inside the
+// strictest slow zone, where noise hardly reaches, it raises at once.
+const OVERTAKEN_RAISE_DELAY = 30_000
+
+// An overtaken boat stays overtaken through this long (ms) without usable data
+// on it or on own ship, such as reports without a course. After a longer gap
+// it may be doing anything, so it must count as overtaken anew. A boat that
+// falls silent stays usable until its data are older than maxAge.
+const OVERTAKEN_DATA_GAP = 60_000
 
 // A target already alarmed ranks as if its closest approach came this many
 // seconds sooner, so two targets of similar urgency don't take turns at the
@@ -154,6 +176,23 @@ function innermostCpa(zones: Zone[]): number {
   return strictest?.cpa ?? 0
 }
 
+/**
+ * `zones` with each distance cut to the largest distance of the slow zones at
+ * the same or a stricter level (the smallest when none is that strict).
+ */
+function cutDistances(zones: Zone[], slowZones: Zone[]): Zone[] {
+  return zones.map((z) => {
+    const caps = slowZones.filter((s) => SEVERITY[s.level] >= SEVERITY[z.level]).map((s) => s.cpa)
+    const cap = caps.length > 0 ? Math.max(...caps) : Math.min(...slowZones.map((s) => s.cpa))
+    return { ...z, cpa: Math.min(z.cpa, cap) }
+  })
+}
+
+// The zone sets a target can be judged by, from the most lenient.
+const SLOW_SET = 0
+const OVERTAKEN_SET = 1
+const NORMAL_SET = 2
+
 function contextOf(targetId: string, node: TargetNode | undefined): string {
   return node?.context ?? `vessels.${targetId}`
 }
@@ -170,17 +209,41 @@ export class Evaluator {
   private readonly levels = new Map<string, AlertLevel>()
   private slow = false
   private slowTargets = new Set<string>()
+  /** When each overtaken target last had usable data, ms since the epoch. */
+  private overtakenTargets = new Map<string, number>()
+  /** The zone set each target was judged by at the last evaluation. */
+  private zoneSets = new Map<string, number>()
+  /** Time each overtaken target without a level has spent in a zone, net (ms), and when it was last judged. */
+  private overtakenInZone = new Map<string, { net: number; at: number }>()
   private asternTargets = new Set<string>()
   /** When each target began keeping its distance, ms since the epoch. */
   private keepingDistanceSince = new Map<string, number>()
   private readonly raised = new Set<string>()
   private readonly motion = new MotionCheck()
   private readonly drift = new DriftDetector()
+  /** When `evaluate` last ran, ms since the epoch. */
+  private lastEvaluation: number | undefined
+
+  /** The normal zones with the slow zones' distances, for overtaken targets. */
+  private readonly overtakenZones: Zone[]
+  /** The strictest slow zones, inside which an overtaken target raises at once. */
+  private readonly overtakenAtOnceZones: Zone[]
+  /**
+   * Range (m) beyond which no normal zone can raise a boat that moves
+   * relative to us no faster than an overtaken one may.
+   */
+  private readonly overtakenRange: number
 
   constructor(
     private readonly options: EvaluatorOptions,
     private readonly sink: AlarmSink
-  ) {}
+  ) {
+    this.overtakenZones = cutDistances(options.zones, options.slowZones)
+    const strictest = Math.max(...options.slowZones.map((z) => SEVERITY[z.level]))
+    this.overtakenAtOnceZones = options.slowZones.filter((z) => SEVERITY[z.level] === strictest)
+    const speed = options.slowSpeed + SLOW_RELEASE_MARGIN
+    this.overtakenRange = Math.max(0, ...options.zones.map((z) => z.cpa + z.tcpa * speed))
+  }
 
   /**
    * @param own own ship, or null when its own data is missing/stale
@@ -193,8 +256,13 @@ export class Evaluator {
     nowMs: number
   ): Evaluation[] {
     const evaluations: Evaluation[] = []
+    const sinceLastEvaluation = nowMs - (this.lastEvaluation ?? nowMs)
+    this.lastEvaluation = nowMs
     const ownSlow = this.updateOwnSlow(own)
     const slowTargets = new Set<string>()
+    const overtakenTargets = new Map<string, number>()
+    const zoneSets = new Map<string, number>()
+    const overtakenInZone = new Map<string, { net: number; at: number }>()
     const asternTargets = new Set<string>()
     const keepingDistanceSince = new Map<string, number>()
     const candidates: Candidate[] = []
@@ -212,6 +280,21 @@ export class Evaluator {
       const result = own && target ? computeCpa(own, target) : null
       const context = contextOf(targetId, node)
       if (!target || !result || result.range > this.options.maxRange) {
+        // A short gap in the data doesn't end an overtaking: abreast, the boat
+        // could not count as overtaken anew.
+        const lastData = this.overtakenTargets.get(targetId)
+        if (
+          !result &&
+          lastData !== undefined &&
+          nowMs >= lastData &&
+          nowMs - lastData <= OVERTAKEN_DATA_GAP
+        ) {
+          overtakenTargets.set(targetId, lastData)
+          const inZone = this.overtakenInZone.get(targetId)
+          if (inZone) {
+            overtakenInZone.set(targetId, inZone)
+          }
+        }
         evaluations.push({ targetId, context, result: null })
         continue
       }
@@ -227,10 +310,44 @@ export class Evaluator {
       // by the slow zones even while own ship is moving. A boat found
       // drifting is moving, whatever it reports.
       const stopped = target === reported && target.sog === 0
-      const zones =
-        (ownSlow && targetSlow) || (stopped && this.options.slowSpeed > 0)
-          ? this.options.slowZones
-          : this.options.zones
+      // We overtake a boat when we come up on it from more than 22.5° abaft
+      // its beam (COLREG rule 13), faster than it along its course. Gaining
+      // on it slowly, we have minutes to act, so it raises only for a closest
+      // approach as close as the slow zones demand, though as early as the
+      // normal zones would: passing it 0.2 NM off raises nothing, while one
+      // that turns into us warns in good time. It stays overtaken while the
+      // speed between us stays low, however the bearing swings as we draw
+      // abeam and pass, and even should it gain on us again: two boats abreast
+      // at nearly the same speed have a closest approach that wanders back and
+      // forth with speed noise, which the normal zones would keep alarming
+      // for. It is let go once too far off for the normal zones to raise
+      // anything at that speed. A boat overtaking us, or one crossing at a
+      // fine angle, keeps the normal zones however slowly it closes.
+      const wasOvertaken = this.overtakenTargets.has(targetId)
+      const overtaken =
+        own !== null &&
+        isSlow(result.relativeSpeed, this.options.slowSpeed, wasOvertaken) &&
+        result.range <= this.overtakenRange &&
+        (wasOvertaken ||
+          (own.sog * Math.cos(own.cog - target.cog) > target.sog &&
+            Math.cos(result.bearing - target.cog) > ABAFT_BEAM))
+      if (overtaken) {
+        overtakenTargets.set(targetId, nowMs)
+      }
+      const slow = (ownSlow && targetSlow) || (stopped && this.options.slowSpeed > 0)
+      const judgedBy = slow ? SLOW_SET : overtaken ? OVERTAKEN_SET : NORMAL_SET
+      let zoneSet = judgedBy
+      // A raised level keeps the strictest zones it was judged by until it
+      // clears: speed noise near a threshold would otherwise swap the zones
+      // every few updates, clearing the alarm and raising it anew, each time
+      // with sound.
+      const current = this.levels.get(targetId)
+      const previous = this.zoneSets.get(targetId)
+      if (current !== undefined && previous !== undefined && previous > zoneSet) {
+        zoneSet = previous
+      }
+      zoneSets.set(targetId, zoneSet)
+      const zones = this.zonesOf(zoneSet)
       // A target crossing behind us is no threat unless it comes really close,
       // so it raises nothing while its CPA stays outside the innermost zone's
       // distance. One that will come that close, such as a ship overtaking
@@ -240,7 +357,6 @@ export class Evaluator {
       if (astern) {
         asternTargets.add(targetId)
       }
-      const current = this.levels.get(targetId)
       const passesWideAstern = astern && current === undefined && result.cpa > innermostCpa(zones)
       // Boats keeping their distance are at closest approach for as long as
       // they do, which would hold a level raised while one of them moved for
@@ -252,7 +368,30 @@ export class Evaluator {
         keepingDistanceSince.set(targetId, since)
         tcpa = (since - nowMs) / 1000
       }
-      const level = passesWideAstern ? undefined : assess(zones, result.cpa, tcpa, current)
+      let level = passesWideAstern ? undefined : assess(zones, result.cpa, tcpa, current)
+      // Custom zones can be laxer than the slow ones in places, so the zones
+      // held for a raised level don't stop the ones it would be judged by now
+      // from raising it further.
+      if (zoneSet !== judgedBy) {
+        const now = assess(this.zonesOf(judgedBy), result.cpa, tcpa, current)
+        if (now && (!level || SEVERITY[now] > SEVERITY[level])) {
+          level = now
+        }
+      }
+      if (current === undefined && zoneSet === OVERTAKEN_SET) {
+        // An evaluation counts for no more than the time since the one
+        // before, so a gap in this boat's data adds little.
+        const before = this.overtakenInZone.get(targetId)
+        const step = before ? Math.max(0, Math.min(nowMs - before.at, sinceLastEvaluation)) : 0
+        const net = Math.max(0, (before?.net ?? 0) + (level ? step : -step / 3))
+        overtakenInZone.set(targetId, { net, at: nowMs })
+        if (
+          net < OVERTAKEN_RAISE_DELAY &&
+          assess(this.overtakenAtOnceZones, result.cpa, tcpa, undefined) === undefined
+        ) {
+          level = undefined
+        }
+      }
       if (level) {
         candidates.push({ targetId, node, level, result, tcpa, target })
       }
@@ -260,6 +399,9 @@ export class Evaluator {
 
     this.keepingDistanceSince = keepingDistanceSince
     this.slowTargets = slowTargets
+    this.overtakenTargets = overtakenTargets
+    this.zoneSets = zoneSets
+    this.overtakenInZone = overtakenInZone
     this.asternTargets = asternTargets
     this.motion.retain(seen)
     this.drift.retain(seen)
@@ -288,12 +430,24 @@ export class Evaluator {
   stop(): void {
     this.levels.clear()
     this.slowTargets.clear()
+    this.overtakenTargets.clear()
+    this.zoneSets.clear()
+    this.lastEvaluation = undefined
+    this.overtakenInZone.clear()
     this.asternTargets.clear()
     this.keepingDistanceSince.clear()
     this.raised.clear()
     this.motion.clear()
     this.drift.clear()
     this.sink.clearAll()
+  }
+
+  private zonesOf(zoneSet: number): Zone[] {
+    return zoneSet === NORMAL_SET
+      ? this.options.zones
+      : zoneSet === OVERTAKEN_SET
+        ? this.overtakenZones
+        : this.options.slowZones
   }
 
   private updateOwnSlow(own: Track | null): boolean {
