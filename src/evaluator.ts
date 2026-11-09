@@ -35,7 +35,8 @@ export interface EvaluatorOptions {
   /**
    * Zones used instead of `zones` while own ship and the target are both
    * slower than `slowSpeed`, and for a stopped target. A target own ship
-   * overtakes slower than that is judged by `zones` cut to these distances.
+   * overtakes slower than that, and a moving target slower than 6 kn while
+   * own ship is stopped, are judged by `zones` cut to these distances.
    */
   slowZones: Zone[]
   /** Speed (m/s) below which `slowZones` apply; 0 turns this off. */
@@ -96,6 +97,13 @@ const OVERTAKEN_DATA_GAP = 60_000
 // no longer than this (ms), one missed Class B report, since it may have
 // turned since.
 const MAX_DEAD_RECKONING = 60_000
+
+// While own ship is stopped, a boat under way slower than this (m/s, 6 kn),
+// harbour traffic, is judged by the cut zones. A faster one keeps the normal
+// zones: within their time window it is still far off, where a degree or two
+// of error in its reported course puts its closest approach beyond the cut
+// distances, and a ship heading straight for us would warn minutes late.
+const HARBOUR_TRAFFIC_SPEED = (6 * 1852) / 3600
 
 // A target already alarmed ranks as if its closest approach came this many
 // seconds sooner, so two targets of similar urgency don't take turns at the
@@ -209,9 +217,10 @@ function cutDistances(zones: Zone[], slowZones: Zone[]): Zone[] {
   })
 }
 
-// The zone sets a target can be judged by, from the most lenient.
+// The zone sets a target can be judged by, from the most lenient. CUT_SET is
+// the normal zones with the slow zones' distances.
 const SLOW_SET = 0
-const OVERTAKEN_SET = 1
+const CUT_SET = 1
 const NORMAL_SET = 2
 
 function contextOf(targetId: string, node: TargetNode | undefined): string {
@@ -232,8 +241,8 @@ export class Evaluator {
   private slowTargets = new Set<string>()
   /** When each overtaken target last had usable data, ms since the epoch. */
   private overtakenTargets = new Map<string, number>()
-  /** The zone set each target was judged by at the last evaluation. */
-  private zoneSets = new Map<string, number>()
+  /** The zone sets each target has been judged by since its level was raised. */
+  private zoneSets = new Map<string, ReadonlySet<number>>()
   /** Time each overtaken target without a level has spent in a zone, net (ms), and when it was last judged. */
   private overtakenInZone = new Map<string, { net: number; at: number }>()
   private asternTargets = new Set<string>()
@@ -245,8 +254,8 @@ export class Evaluator {
   /** When `evaluate` last ran, ms since the epoch. */
   private lastEvaluation: number | undefined
 
-  /** The normal zones with the slow zones' distances, for overtaken targets. */
-  private readonly overtakenZones: Zone[]
+  /** The normal zones with the slow zones' distances. */
+  private readonly cutZones: Zone[]
   /** The strictest slow zones, inside which an overtaken target raises at once. */
   private readonly overtakenAtOnceZones: Zone[]
   /**
@@ -259,7 +268,7 @@ export class Evaluator {
     private readonly options: EvaluatorOptions,
     private readonly sink: AlarmSink
   ) {
-    this.overtakenZones = cutDistances(options.zones, options.slowZones)
+    this.cutZones = cutDistances(options.zones, options.slowZones)
     const strictest = Math.max(...options.slowZones.map((z) => SEVERITY[z.level]))
     this.overtakenAtOnceZones = options.slowZones.filter((z) => SEVERITY[z.level] === strictest)
     const speed = options.slowSpeed + SLOW_RELEASE_MARGIN
@@ -280,9 +289,11 @@ export class Evaluator {
     const sinceLastEvaluation = nowMs - (this.lastEvaluation ?? nowMs)
     this.lastEvaluation = nowMs
     const ownSlow = this.updateOwnSlow(own)
+    // Own ship as judged after the motion and drift checks: drifting, it moves.
+    const ownStopped = own !== null && own.sog === 0 && this.options.slowSpeed > 0
     const slowTargets = new Set<string>()
     const overtakenTargets = new Map<string, number>()
-    const zoneSets = new Map<string, number>()
+    const zoneSets = new Map<string, ReadonlySet<number>>()
     const overtakenInZone = new Map<string, { net: number; at: number }>()
     const asternTargets = new Set<string>()
     const keepingDistanceSince = new Map<string, number>()
@@ -356,20 +367,23 @@ export class Evaluator {
       if (overtaken) {
         overtakenTargets.set(targetId, nowMs)
       }
-      const slow = (ownSlow && targetSlow) || (stopped && this.options.slowSpeed > 0)
-      const judgedBy = slow ? SLOW_SET : overtaken ? OVERTAKEN_SET : NORMAL_SET
-      let zoneSet = judgedBy
-      // A raised level keeps the strictest zones it was judged by until it
-      // clears: speed noise near a threshold would otherwise swap the zones
-      // every few updates, clearing the alarm and raising it anew, each time
-      // with sound.
+      // Lying at a berth or at anchor, we see boats come and go a few boat
+      // lengths off all the time, and the normal zones would alarm for each.
+      // While we are stopped, harbour traffic raises only for a closest
+      // approach as close as the slow zones demand, though as early as the
+      // normal zones would, so a boat heading straight for us still warns in
+      // good time.
+      const harbourTraffic = ownStopped && target.sog < HARBOUR_TRAFFIC_SPEED
       const current = this.levels.get(targetId)
-      const previous = this.zoneSets.get(targetId)
-      if (current !== undefined && previous !== undefined && previous > zoneSet) {
-        zoneSet = previous
-      }
-      zoneSets.set(targetId, zoneSet)
-      const zones = this.zonesOf(zoneSet)
+      // Such a boat faster than slowSpeed, with nothing raised yet, leaves the
+      // slow zones at once rather than after their release margin, so one
+      // speeding up towards us warns as early as the normal zones would. A
+      // raised level stays on its zones, as below.
+      const leftSlow =
+        harbourTraffic && current === undefined && target.sog >= this.options.slowSpeed
+      const slow = (ownSlow && targetSlow && !leftSlow) || (stopped && this.options.slowSpeed > 0)
+      const judgedBy = slow ? SLOW_SET : overtaken || harbourTraffic ? CUT_SET : NORMAL_SET
+      const zones = this.zonesOf(judgedBy)
       // A target crossing behind us is no threat unless it comes really close,
       // so it raises nothing while its CPA stays outside the innermost zone's
       // distance. One that will come that close, such as a ship overtaking
@@ -399,16 +413,24 @@ export class Evaluator {
       const judgedTcpa =
         !result.keepingDistance && target.sog > 0 && tcpa < 0 && tcpa > -carried ? 0 : tcpa
       let level = passesWideAstern ? undefined : assess(zones, result.cpa, judgedTcpa, current)
-      // Custom zones can be laxer than the slow ones in places, so the zones
-      // held for a raised level don't stop the ones it would be judged by now
-      // from raising it further.
-      if (zoneSet !== judgedBy) {
-        const now = assess(this.zonesOf(judgedBy), result.cpa, judgedTcpa, current)
-        if (now && (!level || SEVERITY[now] > SEVERITY[level])) {
-          level = now
+      // A raised level is judged by every zone set it has been judged by since
+      // it was raised, until it clears: speed noise near a threshold would
+      // otherwise swap the zones every few updates, clearing the alarm and
+      // raising it anew, each time with sound. Custom zones need not be
+      // stricter in one set than in another, so it takes the highest level
+      // any of them gives.
+      const judgedSets = new Set(current !== undefined ? this.zoneSets.get(targetId) : undefined)
+      judgedSets.add(judgedBy)
+      for (const set of judgedSets) {
+        if (set !== judgedBy) {
+          const held = assess(this.zonesOf(set), result.cpa, judgedTcpa, current)
+          if (held && (!level || SEVERITY[held] > SEVERITY[level])) {
+            level = held
+          }
         }
       }
-      if (current === undefined && zoneSet === OVERTAKEN_SET) {
+      zoneSets.set(targetId, judgedSets)
+      if (current === undefined && overtaken && judgedBy === CUT_SET) {
         // An evaluation counts for no more than the time since the one
         // before, so a gap in this boat's data adds little.
         const before = this.overtakenInZone.get(targetId)
@@ -475,8 +497,8 @@ export class Evaluator {
   private zonesOf(zoneSet: number): Zone[] {
     return zoneSet === NORMAL_SET
       ? this.options.zones
-      : zoneSet === OVERTAKEN_SET
-        ? this.overtakenZones
+      : zoneSet === CUT_SET
+        ? this.cutZones
         : this.options.slowZones
   }
 
