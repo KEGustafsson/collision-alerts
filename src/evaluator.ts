@@ -105,6 +105,13 @@ const MAX_DEAD_RECKONING = 60_000
 // distances, and a ship heading straight for us would warn minutes late.
 const HARBOUR_TRAFFIC_SPEED = (6 * 1852) / 3600
 
+// A raised target pushed out of the most urgent by others is cleared. Below
+// alarm level, and no higher than when it was pushed out, it is held back this
+// long (ms) before it may be raised again: raised at once, it would sound
+// again for a warning already given, and boats taking turns at the last
+// places would sound every few seconds. An alarm is never held back.
+const DISPLACED_HOLD = 120_000
+
 // A target already alarmed ranks as if its closest approach came this many
 // seconds sooner, so two targets of similar urgency don't take turns at the
 // last alarm slot, which would re-sound the alarm every few seconds.
@@ -233,7 +240,7 @@ function contextOf(targetId: string, node: TargetNode | undefined): string {
  *
  * Every target keeps its level, but only the `maxAlarms` most urgent are
  * raised: arriving in a crowded anchorage would otherwise raise one alarm per
- * moored boat ahead.
+ * moored boat ahead. A warning pushed out is held back for a while.
  */
 export class Evaluator {
   private readonly levels = new Map<string, AlertLevel>()
@@ -249,6 +256,8 @@ export class Evaluator {
   /** When each target began keeping its distance, ms since the epoch. */
   private keepingDistanceSince = new Map<string, number>()
   private readonly raised = new Set<string>()
+  /** Targets pushed out of the most urgent: their level then, and when. */
+  private displaced = new Map<string, { level: AlertLevel; at: number }>()
   private readonly motion = new MotionCheck()
   private readonly drift = new DriftDetector()
   /** When `evaluate` last ran, ms since the epoch. */
@@ -299,6 +308,8 @@ export class Evaluator {
     const keepingDistanceSince = new Map<string, number>()
     const candidates: Candidate[] = []
     const seen = new Set<string>()
+    /** Targets without usable data on them or on own ship this evaluation. */
+    const withoutData = new Set<string>()
 
     for (const [targetId, node] of Object.entries(vessels)) {
       if (targetId === selfId || targetId === 'self') {
@@ -313,6 +324,9 @@ export class Evaluator {
       const result = own && target ? computeCpa(own, deadReckon(target, carried)) : null
       const context = contextOf(targetId, node)
       if (!target || !result || result.range > this.options.maxRange) {
+        if (!result) {
+          withoutData.add(targetId)
+        }
         // A short gap in the data doesn't end an overtaking: abreast, the boat
         // could not count as overtaken anew.
         const lastData = this.overtakenTargets.get(targetId)
@@ -461,20 +475,53 @@ export class Evaluator {
     for (const c of candidates) {
       this.levels.set(c.targetId, c.level)
     }
+    // A target held back keeps its hold through a moment without usable
+    // data, such as a report without a course or no report at all. One that
+    // no longer has a level is no longer held back: should it raise again,
+    // that is a new risk.
+    const levelOf = new Map(candidates.map((c) => [c.targetId, c.level]))
+    const displaced = new Map<string, { level: AlertLevel; at: number }>()
+    for (const [targetId, d] of this.displaced) {
+      const kept = levelOf.has(targetId) || withoutData.has(targetId) || !seen.has(targetId)
+      if (kept && nowMs >= d.at && nowMs - d.at < DISPLACED_HOLD) {
+        displaced.set(targetId, d)
+      }
+    }
+    const heldBack = (c: Candidate) => {
+      const d = displaced.get(c.targetId)
+      return (
+        d !== undefined &&
+        SEVERITY[c.level] < SEVERITY.alarm &&
+        SEVERITY[c.level] <= SEVERITY[d.level]
+      )
+    }
     const shown = candidates
+      .filter((c) => !heldBack(c))
       .sort((a, b) => this.compareUrgency(a, b))
       .slice(0, this.options.maxAlarms)
     const shownIds = new Set(shown.map((c) => c.targetId))
-    // Clear displaced alarms first, so no more than maxAlarms are ever raised.
-    for (const targetId of [...this.raised]) {
-      if (!shownIds.has(targetId)) {
-        this.raised.delete(targetId)
-        this.sink.set(targetId, undefined)
+    const cleared = [...this.raised].filter((targetId) => !shownIds.has(targetId))
+    // One left raised by a clear that failed keeps the hold it got then.
+    for (const targetId of cleared) {
+      const level = levelOf.get(targetId)
+      if (level && !displaced.has(targetId)) {
+        displaced.set(targetId, { level, at: nowMs })
       }
     }
+    // Raised again, it is held back no longer.
     for (const c of shown) {
-      this.raised.add(c.targetId)
+      displaced.delete(c.targetId)
+    }
+    // Kept before the sink is driven, which can throw.
+    this.displaced = displaced
+    // Clear displaced alarms first, so no more than maxAlarms are ever raised.
+    for (const targetId of cleared) {
+      this.raised.delete(targetId)
+      this.sink.set(targetId, undefined)
+    }
+    for (const c of shown) {
       this.sink.set(c.targetId, this.alert(c.targetId, c.node, c.level, c.result, c.target))
+      this.raised.add(c.targetId)
     }
     return evaluations
   }
@@ -489,6 +536,7 @@ export class Evaluator {
     this.asternTargets.clear()
     this.keepingDistanceSince.clear()
     this.raised.clear()
+    this.displaced.clear()
     this.motion.clear()
     this.drift.clear()
     this.sink.clearAll()

@@ -1238,6 +1238,197 @@ describe('Evaluator', () => {
     expect(sink.calls).toContainEqual([OTHER, undefined])
   })
 
+  describe('a target pushed out at the cap', () => {
+    const COS50 = Math.cos((50 * Math.PI) / 180)
+    // `northNm` north, passing `eastNm` abeam, closing at 10 m/s with us.
+    const at = (northNm: number, eastNm: number) =>
+      vessel(50 + northNm / 60, 1 + eastNm / 60 / COS50, 180, 5)
+    // A warning: CPA 0.4 NM in 93 s.
+    const passing = at(0.5, 0.4)
+    // An alarm: CPA 0 in 185 s.
+    const headOn = at(1, 0)
+    // In no zone: CPA 2 NM.
+    const wide = at(3, 2)
+    const pushedOut = () => {
+      const { sink, ev } = setup({ maxAlarms: 1 })
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW)
+      ev.evaluate(own, { [OTHER]: passing, [THIRD]: headOn }, SELF, NOW + 2000)
+      sink.calls = []
+      return { sink, ev }
+    }
+
+    it('is held back for two minutes as a warning, the place free or not', () => {
+      const { sink, ev } = pushedOut()
+      // The head-on boat is gone, which frees the place.
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 4000)
+      // A report without a course doesn't start the hold anew.
+      const noCourse = at(0.5, 0.4)
+      delete defined(noCourse.navigation).courseOverGroundTrue
+      ev.evaluate(own, { [OTHER]: noCourse }, SELF, NOW + 120_000)
+      // Pushed out at NOW + 2 s: the last moment of the hold.
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 121_999)
+      expect(sink.calls).toEqual([[THIRD, undefined]])
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 122_000)
+      expect(sink.calls.at(-1)).toEqual([OTHER, expect.objectContaining({ level: 'warn' })])
+    })
+
+    it('is raised at once at a higher level, and stays raised when it drops back', () => {
+      const { sink, ev } = pushedOut()
+      // It turns towards us as the head-on boat goes.
+      ev.evaluate(own, { [OTHER]: headOn }, SELF, NOW + 4000)
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 6000)
+      expect(sink.calls).toEqual([
+        [THIRD, undefined],
+        [OTHER, expect.objectContaining({ level: 'alarm' })],
+        [OTHER, expect.objectContaining({ level: 'warn' })]
+      ])
+    })
+
+    it('is never held back as an alarm', () => {
+      const { sink, ev } = setup({ maxAlarms: 1 })
+      ev.evaluate(own, { [OTHER]: headOn }, SELF, NOW)
+      // Head-on from 0.3 NM, closest approach 2 min sooner: it takes the place.
+      ev.evaluate(own, { [OTHER]: headOn, [FOURTH]: at(0.3, 0) }, SELF, NOW + 2000)
+      sink.calls = []
+      ev.evaluate(own, { [OTHER]: headOn }, SELF, NOW + 4000)
+      expect(sink.calls).toEqual([
+        [FOURTH, undefined],
+        [OTHER, expect.objectContaining({ level: 'alarm' })]
+      ])
+    })
+
+    it('stays held back through a report without a course', () => {
+      const { sink, ev } = pushedOut()
+      const noCourse = at(0.5, 0.4)
+      delete defined(noCourse.navigation).courseOverGroundTrue
+      ev.evaluate(own, { [OTHER]: noCourse }, SELF, NOW + 4000)
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 6000)
+      expect(sink.calls).toEqual([[THIRD, undefined]])
+    })
+
+    it('stays held back through a moment without own data', () => {
+      const { sink, ev } = pushedOut()
+      ev.evaluate(null, { [OTHER]: passing }, SELF, NOW + 4000)
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 6000)
+      expect(sink.calls).toEqual([[THIRD, undefined]])
+    })
+
+    it('stays held back while it is missing from the data for a moment', () => {
+      const { sink, ev } = pushedOut()
+      ev.evaluate(own, {}, SELF, NOW + 4000)
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 6000)
+      expect(sink.calls).toEqual([[THIRD, undefined]])
+    })
+
+    it('keeps the hold when raising another target fails', () => {
+      const { sink, ev } = setup({ maxAlarms: 1 })
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW)
+      const set = sink.set.bind(sink)
+      sink.set = (id: string, alert: CollisionAlert | undefined) => {
+        if (alert) {
+          throw new Error('raise failed')
+        }
+        set(id, alert)
+      }
+      // The warning is cleared for the head-on boat, whose alarm fails.
+      expect(() =>
+        ev.evaluate(own, { [OTHER]: passing, [THIRD]: headOn }, SELF, NOW + 2000)
+      ).toThrow('raise failed')
+      sink.set = set
+      sink.calls = []
+      // The head-on boat, never raised, is gone; the warning stays held back.
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 4000)
+      expect(sink.calls).toEqual([])
+    })
+
+    it('keeps the hold time of a target left raised by a failed clear', () => {
+      const FIFTH = 'urn:mrn:imo:mmsi:555555555'
+      const { sink, ev } = setup({ maxAlarms: 2 })
+      // Two warnings, 0.4 NM to either side.
+      const warnings = { [OTHER]: passing, [FOURTH]: at(0.5, -0.4) }
+      ev.evaluate(own, warnings, SELF, NOW)
+      const set = sink.set.bind(sink)
+      let failed = false
+      sink.set = (id: string, alert: CollisionAlert | undefined) => {
+        if (!alert && !failed) {
+          failed = true
+          throw new Error('clear failed')
+        }
+        set(id, alert)
+      }
+      // Two head-on boats push both out, and the first clear fails.
+      const alarms = { [THIRD]: headOn, [FIFTH]: at(1, 0.05) }
+      expect(() => ev.evaluate(own, { ...warnings, ...alarms }, SELF, NOW + 2000)).toThrow(
+        'clear failed'
+      )
+      ev.evaluate(own, { ...warnings, ...alarms }, SELF, NOW + 4000)
+      sink.calls = []
+      // Both holds end 2 minutes after the push-out.
+      ev.evaluate(own, warnings, SELF, NOW + 122_000)
+      const raised = sink.calls.filter(([, alert]) => alert).map(([id]) => id)
+      expect(raised.sort()).toEqual([OTHER, FOURTH].sort())
+    })
+
+    it('lets go of the hold when raising it higher fails', () => {
+      const { sink, ev } = pushedOut()
+      const set = sink.set.bind(sink)
+      sink.set = (id: string, alert: CollisionAlert | undefined) => {
+        if (alert) {
+          throw new Error('raise failed')
+        }
+        set(id, alert)
+      }
+      // It turns towards us as the head-on boat goes, and its alarm fails.
+      expect(() => ev.evaluate(own, { [OTHER]: headOn }, SELF, NOW + 4000)).toThrow('raise failed')
+      sink.set = set
+      sink.calls = []
+      // Back to a warning, it keeps its place.
+      ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 6000)
+      expect(sink.calls).toEqual([[OTHER, expect.objectContaining({ level: 'warn' })]])
+    })
+
+    it('is raised at once once it has left every zone or the range in between', () => {
+      // 13 NM off, beyond the 12 NM range.
+      for (const away of [wide, at(13, 0)]) {
+        const { sink, ev } = pushedOut()
+        ev.evaluate(own, { [OTHER]: away, [THIRD]: headOn }, SELF, NOW + 4000)
+        sink.calls = []
+        ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 6000)
+        expect(sink.calls).toEqual([
+          [THIRD, undefined],
+          [OTHER, expect.objectContaining({ level: 'warn' })]
+        ])
+      }
+    })
+
+    it('is let go when the clock goes back, and on stop', () => {
+      const back = pushedOut()
+      back.ev.evaluate(own, { [OTHER]: passing }, SELF, NOW - 60_000)
+      expect(back.sink.calls.at(-1)).toEqual([OTHER, expect.objectContaining({ level: 'warn' })])
+      const stopped = pushedOut()
+      stopped.ev.stop()
+      stopped.sink.calls = []
+      stopped.ev.evaluate(own, { [OTHER]: passing }, SELF, NOW + 4000)
+      expect(stopped.sink.calls).toEqual([[OTHER, expect.objectContaining({ level: 'warn' })]])
+    })
+
+    it('leaves the others at a larger cap alone', () => {
+      const { sink, ev } = setup({ maxAlarms: 2 })
+      const sooner = at(0.5, 0.4)
+      // CPA 0.4 NM in 148 s: the later of the two warnings.
+      const later = at(0.8, 0.4)
+      ev.evaluate(own, { [OTHER]: sooner, [THIRD]: later }, SELF, NOW)
+      ev.evaluate(own, { [OTHER]: sooner, [THIRD]: later, [FOURTH]: headOn }, SELF, NOW + 2000)
+      expect(sink.calls).toContainEqual([THIRD, undefined])
+      sink.calls = []
+      ev.evaluate(own, { [OTHER]: sooner, [THIRD]: later }, SELF, NOW + 4000)
+      expect(sink.calls).toEqual([
+        [FOURTH, undefined],
+        [OTHER, expect.objectContaining({ level: 'warn' })]
+      ])
+    })
+  })
+
   it('keeps an alarmed target over a slightly more urgent newcomer', () => {
     const { sink, ev } = setup({ maxAlarms: 1 })
     const first = vessel(50 + 0.6 / 60, 1, 180, 5)
