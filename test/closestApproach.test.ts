@@ -126,6 +126,22 @@ describe('ClosestApproachPublisher', () => {
     expect(send).toHaveBeenCalledTimes(4)
   })
 
+  it('tries a failed clear again next time', () => {
+    const { send, p } = publisher()
+    p.publish([seen()], own, NOW)
+    send.mockImplementationOnce(() => {
+      throw new Error('server busy')
+    })
+    expect(() => {
+      p.publish([lost], own, NOW + 2000)
+    }).toThrow('server busy')
+    p.publish([], own, NOW + 4000)
+    expect(send).toHaveBeenCalledTimes(3)
+    expect(send).toHaveBeenLastCalledWith(CONTEXT, null)
+    p.publish([], own, NOW + 6000)
+    expect(send).toHaveBeenCalledTimes(3)
+  })
+
   it('tries again next time when publishing fails', () => {
     const { send, p } = publisher()
     send.mockImplementationOnce(() => {

@@ -8,8 +8,9 @@ export interface ClosestApproach {
 }
 
 // With no new data on a target and own course and speed unchanged, its
-// closest approach stays where it was and only the time to it runs down,
-// which a display that does not count it down sees this often (ms).
+// closest approach stays where it was and only the time to it runs down. It
+// is sent again at the first evaluation this long (ms) after the last, for a
+// display that does not count it down.
 const REFRESH_MS = 10_000
 
 // A change in own velocity (m/s, as a vector) taken as a change of course or
@@ -93,8 +94,9 @@ export class ClosestApproachPublisher {
   }
 
   private clear(context: string): void {
-    if (this.sent.delete(context)) {
+    if (this.sent.has(context)) {
       this.send(context, null)
+      this.sent.delete(context)
     }
   }
 }
